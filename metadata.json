@@ -1,0 +1,6 @@
+{
+  "name": "OpenLMS Sovereign",
+  "description": "Learning Management System with progress tracking, real-time notifications, SCORM & interactive content, BYO-AI assistant, and configurable cloud database & self-hosting options.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
