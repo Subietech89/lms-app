@@ -1,11 +1,13 @@
-import React, { useState } from "react";
-import {
-  User,
-  UserRole,
-  WebsiteSettings,
-} from "../types";
+import React, { useState, useEffect } from "react";
+import { User, UserRole, WebsiteSettings, DatabaseConfig } from "../types";
 import { StorageService, PRESET_USERS } from "../utils/storage";
 import { THEME_PRESETS, getLogoIcon } from "../utils/theme";
+import {
+  getEffectiveSupabaseConfig,
+  supabaseSignIn,
+  supabaseSignUp,
+  supabaseResetPassword,
+} from "../utils/supabase";
 import {
   GraduationCap,
   BookOpen,
@@ -24,10 +26,13 @@ import {
   Award,
   Users,
   Radio,
-  Sliders,
   ChevronRight,
   Eye,
   EyeOff,
+  AlertCircle,
+  Database,
+  RefreshCw,
+  HelpCircle,
 } from "lucide-react";
 
 interface LoginScreenProps {
@@ -39,7 +44,14 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
   websiteSettings,
   onLoginSuccess,
 }) => {
-  const [authMode, setAuthMode] = useState<"preset" | "credentials" | "register">("preset");
+  const dbConfig: DatabaseConfig = StorageService.getDatabaseConfig();
+  const supabaseConfig = getEffectiveSupabaseConfig();
+  const isSupabaseActive = supabaseConfig.isConfigured && dbConfig.enforceSupabaseAuth !== false;
+  const hidePresets = dbConfig.disablePresetLogins || (isSupabaseActive && dbConfig.disablePresetLogins);
+
+  const [authMode, setAuthMode] = useState<"preset" | "credentials" | "register" | "forgot_password">(
+    hidePresets ? "credentials" : "preset"
+  );
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [showPassword, setShowPassword] = useState(false);
@@ -47,102 +59,227 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
   const [selectedRole, setSelectedRole] = useState<UserRole>("student");
   const [department, setDepartment] = useState("");
   const [errorMessage, setErrorMessage] = useState("");
+  const [successNotice, setSuccessNotice] = useState("");
   const [isLoading, setIsLoading] = useState(false);
 
   const LogoIcon = getLogoIcon(websiteSettings.logoIcon);
   const registeredUsers = StorageService.getAllRegisteredUsers();
 
+  // 1-Click Role Quick Login (Only allowed when preset logins are not disabled)
   const handleRoleQuickLogin = (role: UserRole) => {
+    if (hidePresets) {
+      setErrorMessage("Preset quick-logins have been disabled in production. Please sign in with your Supabase credentials.");
+      return;
+    }
     setIsLoading(true);
     setErrorMessage("");
+    setSuccessNotice("");
     const user = PRESET_USERS[role];
     setTimeout(() => {
       StorageService.login(user);
       onLoginSuccess(user);
       setIsLoading(false);
-    }, 250);
+    }, 200);
   };
 
   const handleUserClick = (user: User) => {
+    if (hidePresets) {
+      setErrorMessage("Please enter your account email and password to authenticate.");
+      return;
+    }
     setIsLoading(true);
     setErrorMessage("");
+    setSuccessNotice("");
     setTimeout(() => {
       StorageService.login(user);
       onLoginSuccess(user);
       setIsLoading(false);
-    }, 250);
+    }, 200);
   };
 
-  const handleCredentialLogin = (e: React.FormEvent) => {
+  // Sign In Handler
+  const handleCredentialLogin = async (e: React.FormEvent) => {
     e.preventDefault();
     setErrorMessage("");
+    setSuccessNotice("");
 
-    if (!email.trim()) {
+    const trimmedEmail = email.trim();
+    if (!trimmedEmail) {
       setErrorMessage("Please enter your email address.");
       return;
     }
 
+    if (!password) {
+      setErrorMessage("Please enter your password.");
+      return;
+    }
+
     setIsLoading(true);
-    setTimeout(() => {
-      const found = registeredUsers.find(
-        (u) => u.email.toLowerCase() === email.trim().toLowerCase()
-      );
 
-      if (found) {
-        StorageService.login(found);
-        onLoginSuccess(found);
+    try {
+      if (isSupabaseActive) {
+        // Authenticate directly against Supabase Auth API
+        const result = await supabaseSignIn(trimmedEmail, password);
+
+        if (!result.success || !result.user) {
+          setErrorMessage(
+            result.error || "Authentication failed. Please verify your email and password in Supabase."
+          );
+          setIsLoading(false);
+          return;
+        }
+
+        onLoginSuccess(result.user);
       } else {
-        // Auto-register as active role
-        const cleanName = email.split("@")[0].replace(/[._]/g, " ");
-        const capitalizedName = cleanName
-          .split(" ")
-          .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
-          .join(" ");
-
-        const newUser = StorageService.registerUser(
-          capitalizedName || "New Learner",
-          email.trim(),
-          selectedRole,
-          department || (selectedRole === "student" ? "General Studies" : "Faculty Department")
+        // Local sovereign fallback
+        const found = registeredUsers.find(
+          (u) => u.email.toLowerCase() === trimmedEmail.toLowerCase()
         );
-        StorageService.login(newUser);
-        onLoginSuccess(newUser);
+
+        if (found) {
+          StorageService.login(found);
+          onLoginSuccess(found);
+        } else {
+          // Auto-register as active role
+          const cleanName = trimmedEmail.split("@")[0].replace(/[._]/g, " ");
+          const capitalizedName = cleanName
+            .split(" ")
+            .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+            .join(" ");
+
+          const newUser = StorageService.registerUser(
+            capitalizedName || "New Learner",
+            trimmedEmail,
+            selectedRole,
+            department || (selectedRole === "student" ? "General Studies" : "Faculty Department")
+          );
+          StorageService.login(newUser);
+          onLoginSuccess(newUser);
+        }
       }
+    } catch (err: any) {
+      setErrorMessage(err.message || "An unexpected error occurred during login.");
+    } finally {
       setIsLoading(false);
-    }, 300);
+    }
   };
 
-  const handleRegister = (e: React.FormEvent) => {
+  // Sign Up / Register Handler
+  const handleRegister = async (e: React.FormEvent) => {
     e.preventDefault();
     setErrorMessage("");
+    setSuccessNotice("");
 
-    if (!name.trim() || !email.trim()) {
+    const trimmedName = name.trim();
+    const trimmedEmail = email.trim();
+
+    if (!trimmedName || !trimmedEmail) {
       setErrorMessage("Please enter both your full name and email.");
+      return;
+    }
+
+    if (!password) {
+      setErrorMessage("Please create a password for your account.");
+      return;
+    }
+
+    if (password.length < 6) {
+      setErrorMessage("Password must be at least 6 characters long.");
       return;
     }
 
     if (
       websiteSettings.registrationDomainFilter &&
-      !email.endsWith(websiteSettings.registrationDomainFilter)
+      !trimmedEmail.endsWith(websiteSettings.registrationDomainFilter)
     ) {
       setErrorMessage(
-        `Registration restricted to domains matching ${websiteSettings.registrationDomainFilter}`
+        `Registration is restricted to domains matching ${websiteSettings.registrationDomainFilter}`
       );
       return;
     }
 
     setIsLoading(true);
-    setTimeout(() => {
-      const newUser = StorageService.registerUser(
-        name.trim(),
-        email.trim(),
-        selectedRole,
-        department.trim() || (selectedRole === "student" ? "General Studies" : "Faculty Department")
-      );
-      StorageService.login(newUser);
-      onLoginSuccess(newUser);
+
+    try {
+      if (isSupabaseActive) {
+        const result = await supabaseSignUp(
+          trimmedEmail,
+          password,
+          trimmedName,
+          selectedRole,
+          department.trim()
+        );
+
+        if (!result.success) {
+          setErrorMessage(result.error || "Failed to create Supabase account.");
+          setIsLoading(false);
+          return;
+        }
+
+        if (result.needsEmailVerification) {
+          setSuccessNotice(
+            `Account created in Supabase! We sent a confirmation link to ${trimmedEmail}. Please verify your email, then return here to sign in.`
+          );
+          setAuthMode("credentials");
+          setIsLoading(false);
+          return;
+        }
+
+        if (result.user) {
+          onLoginSuccess(result.user);
+        }
+      } else {
+        const newUser = StorageService.registerUser(
+          trimmedName,
+          trimmedEmail,
+          selectedRole,
+          department.trim() || (selectedRole === "student" ? "General Studies" : "Faculty Department")
+        );
+        StorageService.login(newUser);
+        onLoginSuccess(newUser);
+      }
+    } catch (err: any) {
+      setErrorMessage(err.message || "An unexpected error occurred during registration.");
+    } finally {
       setIsLoading(false);
-    }, 300);
+    }
+  };
+
+  // Password Reset Handler
+  const handleForgotPassword = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setErrorMessage("");
+    setSuccessNotice("");
+
+    const trimmedEmail = email.trim();
+    if (!trimmedEmail) {
+      setErrorMessage("Please enter the email address for your Supabase account.");
+      return;
+    }
+
+    setIsLoading(true);
+    try {
+      if (isSupabaseActive) {
+        const res = await supabaseResetPassword(trimmedEmail);
+        if (res.success) {
+          setSuccessNotice(
+            `Password reset link has been dispatched to ${trimmedEmail}. Check your inbox to set a new password.`
+          );
+          setAuthMode("credentials");
+        } else {
+          setErrorMessage(res.error || "Failed to dispatch password reset email.");
+        }
+      } else {
+        setSuccessNotice(
+          `Local demo mode: Password reset simulated for ${trimmedEmail}. You can sign in directly.`
+        );
+        setAuthMode("credentials");
+      }
+    } catch (err: any) {
+      setErrorMessage(err.message || "Failed to send password reset email.");
+    } finally {
+      setIsLoading(false);
+    }
   };
 
   return (
@@ -189,10 +326,17 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
         </div>
 
         <div className="flex items-center gap-2 text-xs text-slate-400">
-          <div className="hidden sm:flex items-center gap-1.5 px-3 py-1 rounded-full bg-white/5 border border-white/5 text-slate-300">
-            <Globe className="w-3.5 h-3.5 text-emerald-400" />
-            <span>Google Sites & M365 Ready</span>
-          </div>
+          {isSupabaseActive ? (
+            <div className="flex items-center gap-1.5 px-3 py-1 rounded-full bg-emerald-500/10 border border-emerald-500/30 text-emerald-400 font-mono text-[11px] shadow-xs">
+              <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
+              <span>Supabase Auth Protected</span>
+            </div>
+          ) : (
+            <div className="hidden sm:flex items-center gap-1.5 px-3 py-1 rounded-full bg-white/5 border border-white/5 text-slate-300">
+              <Globe className="w-3.5 h-3.5 text-emerald-400" />
+              <span>Google Sites & M365 Ready</span>
+            </div>
+          )}
           <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 font-mono text-[11px]">
             <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-ping" />
             <span>Online</span>
@@ -207,7 +351,7 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
           <div className="lg:col-span-5 space-y-6 text-center lg:text-left">
             <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 text-xs font-semibold">
               <KeyRound className="w-3.5 h-3.5" />
-              <span>Unified Single Sign-On</span>
+              <span>{isSupabaseActive ? "Supabase Cloud Authentication" : "Unified Single Sign-On"}</span>
             </div>
 
             <div className="space-y-2">
@@ -215,7 +359,9 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
                 Welcome to the Learning Portal
               </h1>
               <p className="text-sm text-slate-400 leading-relaxed">
-                Sign in with your access level to immediately enter your personalized dashboard, courses, and tools.
+                {isSupabaseActive
+                  ? "Sign in with your verified Supabase user credentials to access your course catalog, faculty gradebooks, or administrator controls."
+                  : "Sign in with your access level to immediately enter your personalized dashboard, courses, and tools."}
               </p>
             </div>
 
@@ -252,7 +398,7 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
                 <div>
                   <h4 className="text-xs font-bold text-white">Admin Control Center</h4>
                   <p className="text-[11px] text-slate-400 mt-0.5">
-                    Google Sites & M365 embedding, branding, cloud database sync, and AI model setup.
+                    Google Sites & M365 embedding, branding, Supabase database sync, and AI model setup.
                   </p>
                 </div>
               </div>
@@ -265,60 +411,87 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
               {/* Top Selector Tabs */}
               <div className="flex items-center justify-between border-b border-white/10 pb-4 mb-6">
                 <div>
-                  <h2 className="text-lg font-bold text-white">Sign In to Continue</h2>
+                  <h2 className="text-lg font-bold text-white">
+                    {authMode === "forgot_password"
+                      ? "Reset Password"
+                      : authMode === "register"
+                      ? "Create Account"
+                      : "Sign In to Continue"}
+                  </h2>
                   <p className="text-xs text-slate-400 mt-0.5">
-                    Select a fast-launch profile or enter your credentials
+                    {isSupabaseActive
+                      ? "Secured by Supabase Identity & Access Management"
+                      : "Select a fast-launch profile or enter credentials"}
                   </p>
                 </div>
-                <div className="flex items-center p-1 rounded-xl bg-[#0b0d11] border border-white/10 text-xs">
-                  <button
-                    id="tab-fast-login"
-                    onClick={() => {
-                      setAuthMode("preset");
-                      setErrorMessage("");
-                    }}
-                    className={`px-3 py-1.5 rounded-lg font-semibold transition ${
-                      authMode === "preset"
-                        ? "bg-white/10 text-white shadow-xs"
-                        : "text-slate-400 hover:text-slate-200"
-                    }`}
-                  >
-                    1-Click Roles
-                  </button>
-                  <button
-                    id="tab-custom-login"
-                    onClick={() => {
-                      setAuthMode("credentials");
-                      setErrorMessage("");
-                    }}
-                    className={`px-3 py-1.5 rounded-lg font-semibold transition ${
-                      authMode === "credentials" || authMode === "register"
-                        ? "bg-white/10 text-white shadow-xs"
-                        : "text-slate-400 hover:text-slate-200"
-                    }`}
-                  >
-                    Email / Custom
-                  </button>
-                </div>
+
+                {!hidePresets && (
+                  <div className="flex items-center p-1 rounded-xl bg-[#0b0d11] border border-white/10 text-xs">
+                    <button
+                      id="tab-fast-login"
+                      onClick={() => {
+                        setAuthMode("preset");
+                        setErrorMessage("");
+                        setSuccessNotice("");
+                      }}
+                      className={`px-3 py-1.5 rounded-lg font-semibold transition ${
+                        authMode === "preset"
+                          ? "bg-white/10 text-white shadow-xs"
+                          : "text-slate-400 hover:text-slate-200"
+                      }`}
+                    >
+                      1-Click Roles
+                    </button>
+                    <button
+                      id="tab-custom-login"
+                      onClick={() => {
+                        setAuthMode("credentials");
+                        setErrorMessage("");
+                        setSuccessNotice("");
+                      }}
+                      className={`px-3 py-1.5 rounded-lg font-semibold transition ${
+                        authMode !== "preset"
+                          ? "bg-white/10 text-white shadow-xs"
+                          : "text-slate-400 hover:text-slate-200"
+                      }`}
+                    >
+                      Email Login
+                    </button>
+                  </div>
+                )}
               </div>
 
-              {/* Error Message */}
+              {/* Status & Error Messages */}
               {errorMessage && (
-                <div className="mb-5 p-3 rounded-xl bg-red-500/10 border border-red-500/20 text-red-300 text-xs flex items-center gap-2">
-                  <span className="font-bold">Error:</span>
-                  <span>{errorMessage}</span>
+                <div className="mb-5 p-3.5 rounded-xl bg-red-500/10 border border-red-500/30 text-red-300 text-xs flex items-start gap-2.5 animate-in fade-in">
+                  <AlertCircle className="w-4 h-4 text-red-400 shrink-0 mt-0.5" />
+                  <div className="space-y-0.5">
+                    <span className="font-bold">Authentication Error:</span>
+                    <p className="text-slate-300 leading-relaxed">{errorMessage}</p>
+                  </div>
+                </div>
+              )}
+
+              {successNotice && (
+                <div className="mb-5 p-3.5 rounded-xl bg-emerald-500/10 border border-emerald-500/30 text-emerald-300 text-xs flex items-start gap-2.5 animate-in fade-in">
+                  <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0 mt-0.5" />
+                  <div className="space-y-0.5">
+                    <span className="font-bold">Success:</span>
+                    <p className="text-slate-300 leading-relaxed">{successNotice}</p>
+                  </div>
                 </div>
               )}
 
               {/* VIEW 1: PRESET FAST-LAUNCH PROFILES */}
-              {authMode === "preset" && (
+              {authMode === "preset" && !hidePresets && (
                 <div className="space-y-4 animate-in fade-in duration-200">
                   <div className="text-xs font-semibold uppercase tracking-wider text-slate-400 mb-2">
                     Choose Your Access Level to Open Dashboard:
                   </div>
 
                   {/* 1. Student Access Card */}
-                  <div className="group p-4 rounded-2xl bg-[#0e1117] border border-emerald-500/30 hover:border-emerald-400 hover:bg-[#12161f] transition cursor-pointer shadow-lg relative overflow-hidden"
+                  <div
+                    className="group p-4 rounded-2xl bg-[#0e1117] border border-emerald-500/30 hover:border-emerald-400 hover:bg-[#12161f] transition cursor-pointer shadow-lg relative overflow-hidden"
                     onClick={() => handleRoleQuickLogin("student")}
                   >
                     <div className="flex items-center justify-between gap-3">
@@ -342,9 +515,9 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
                             {PRESET_USERS.student.department}
                           </p>
                           <div className="flex items-center gap-3 mt-1 text-[11px] text-slate-500">
-                            <span>{PRESET_USERS.student.totalPoints} pts earned</span>
+                            <span>Ready to Begin</span>
                             <span>•</span>
-                            <span>{PRESET_USERS.student.learningStreakDays > 0 ? `${PRESET_USERS.student.learningStreakDays} day streak` : "Ready to Begin"}</span>
+                            <span>Course Progress Tracking</span>
                           </div>
                         </div>
                       </div>
@@ -354,14 +527,15 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
                         disabled={isLoading}
                         className="px-4 py-2 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-black font-bold text-xs flex items-center gap-1.5 transition shrink-0 group-hover:translate-x-1"
                       >
-                        <span>Open Student Dashboard</span>
+                        <span>Student Portal</span>
                         <ChevronRight className="w-4 h-4" />
                       </button>
                     </div>
                   </div>
 
                   {/* 2. Teacher Access Card */}
-                  <div className="group p-4 rounded-2xl bg-[#0e1117] border border-blue-500/30 hover:border-blue-400 hover:bg-[#12161f] transition cursor-pointer shadow-lg relative overflow-hidden"
+                  <div
+                    className="group p-4 rounded-2xl bg-[#0e1117] border border-blue-500/30 hover:border-blue-400 hover:bg-[#12161f] transition cursor-pointer shadow-lg relative overflow-hidden"
                     onClick={() => handleRoleQuickLogin("teacher")}
                   >
                     <div className="flex items-center justify-between gap-3">
@@ -385,9 +559,7 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
                             {PRESET_USERS.teacher.department}
                           </p>
                           <div className="flex items-center gap-3 mt-1 text-[11px] text-slate-500">
-                            <span>Courses Under Instruction: 3</span>
-                            <span>•</span>
-                            <span>Gradebook & Labs Active</span>
+                            <span>Gradebook &amp; SCORM Studio</span>
                           </div>
                         </div>
                       </div>
@@ -397,14 +569,15 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
                         disabled={isLoading}
                         className="px-4 py-2 rounded-xl bg-blue-500 hover:bg-blue-400 text-black font-bold text-xs flex items-center gap-1.5 transition shrink-0 group-hover:translate-x-1"
                       >
-                        <span>Open Teacher Dashboard</span>
+                        <span>Faculty Portal</span>
                         <ChevronRight className="w-4 h-4" />
                       </button>
                     </div>
                   </div>
 
                   {/* 3. Administrator Access Card */}
-                  <div className="group p-4 rounded-2xl bg-[#0e1117] border border-purple-500/30 hover:border-purple-400 hover:bg-[#12161f] transition cursor-pointer shadow-lg relative overflow-hidden"
+                  <div
+                    className="group p-4 rounded-2xl bg-[#0e1117] border border-purple-500/30 hover:border-purple-400 hover:bg-[#12161f] transition cursor-pointer shadow-lg relative overflow-hidden"
                     onClick={() => handleRoleQuickLogin("admin")}
                   >
                     <div className="flex items-center justify-between gap-3">
@@ -428,7 +601,7 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
                             {PRESET_USERS.admin.department}
                           </p>
                           <div className="flex items-center gap-3 mt-1 text-[11px] text-slate-500">
-                            <span>Google Sites & M365 • System Config</span>
+                            <span>Google Sites &amp; Database Settings</span>
                           </div>
                         </div>
                       </div>
@@ -438,180 +611,246 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
                         disabled={isLoading}
                         className="px-4 py-2 rounded-xl bg-purple-500 hover:bg-purple-400 text-white font-bold text-xs flex items-center gap-1.5 transition shrink-0 group-hover:translate-x-1"
                       >
-                        <span>Open Admin Dashboard</span>
+                        <span>Admin Portal</span>
                         <ChevronRight className="w-4 h-4" />
                       </button>
                     </div>
                   </div>
-
-                  {/* Registered Custom Accounts (if any) */}
-                  {registeredUsers.length > 3 && (
-                    <div className="pt-3 border-t border-white/5">
-                      <p className="text-[11px] text-slate-400 mb-2 font-medium">
-                        Other registered users on this portal:
-                      </p>
-                      <div className="flex flex-wrap gap-2">
-                        {registeredUsers.slice(3).map((u) => (
-                          <button
-                            key={u.id}
-                            onClick={() => handleUserClick(u)}
-                            className="flex items-center gap-2 px-3 py-1.5 rounded-xl bg-white/5 hover:bg-white/10 border border-white/5 text-xs text-slate-200 transition"
-                          >
-                            <span className="w-2 h-2 rounded-full bg-emerald-400" />
-                            <span>{u.name} ({u.role})</span>
-                          </button>
-                        ))}
-                      </div>
-                    </div>
-                  )}
                 </div>
               )}
 
-              {/* VIEW 2: CUSTOM CREDENTIALS LOGIN / REGISTER */}
-              {(authMode === "credentials" || authMode === "register") && (
+              {/* VIEW 2: CUSTOM CREDENTIALS LOGIN / REGISTER / FORGOT PASSWORD */}
+              {(authMode === "credentials" || authMode === "register" || authMode === "forgot_password") && (
                 <div className="space-y-4 animate-in fade-in duration-200">
                   <div className="flex items-center justify-between pb-1">
                     <span className="text-xs font-semibold text-slate-300">
-                      {authMode === "register" ? "Create New Portal User" : "Sign In with Email"}
-                    </span>
-                    <button
-                      onClick={() =>
-                        setAuthMode(authMode === "register" ? "credentials" : "register")
-                      }
-                      className="text-xs text-emerald-400 hover:underline font-medium"
-                    >
                       {authMode === "register"
-                        ? "Already have an account? Sign In"
-                        : "Need a new account? Register"}
-                    </button>
-                  </div>
-
-                  <form
-                    onSubmit={authMode === "register" ? handleRegister : handleCredentialLogin}
-                    className="space-y-3.5"
-                  >
-                    {authMode === "register" && (
-                      <div>
-                        <label className="block text-xs text-slate-400 mb-1 font-medium">
-                          Full Name
-                        </label>
-                        <input
-                          type="text"
-                          value={name}
-                          onChange={(e) => setName(e.target.value)}
-                          placeholder="e.g. Jordan Miller"
-                          className="w-full px-3.5 py-2.5 rounded-xl bg-[#0b0d11] border border-white/10 text-xs text-white placeholder-slate-500 focus:outline-none focus:ring-1 focus:ring-emerald-500 focus:border-emerald-500 transition"
-                        />
-                      </div>
-                    )}
-
-                    <div>
-                      <label className="block text-xs text-slate-400 mb-1 font-medium">
-                        Email Address
-                      </label>
-                      <div className="relative">
-                        <Mail className="w-4 h-4 text-slate-500 absolute left-3.5 top-3 pointer-events-none" />
-                        <input
-                          type="email"
-                          value={email}
-                          onChange={(e) => setEmail(e.target.value)}
-                          placeholder="you@institution.edu or student@org.com"
-                          className="w-full pl-10 pr-3.5 py-2.5 rounded-xl bg-[#0b0d11] border border-white/10 text-xs text-white placeholder-slate-500 focus:outline-none focus:ring-1 focus:ring-emerald-500 focus:border-emerald-500 transition"
-                        />
-                      </div>
-                    </div>
-
-                    <div>
-                      <label className="block text-xs text-slate-400 mb-1 font-medium">
-                        Password
-                      </label>
-                      <div className="relative">
-                        <Lock className="w-4 h-4 text-slate-500 absolute left-3.5 top-3 pointer-events-none" />
-                        <input
-                          type={showPassword ? "text" : "password"}
-                          value={password}
-                          onChange={(e) => setPassword(e.target.value)}
-                          placeholder="••••••••••••"
-                          className="w-full pl-10 pr-10 py-2.5 rounded-xl bg-[#0b0d11] border border-white/10 text-xs text-white placeholder-slate-500 focus:outline-none focus:ring-1 focus:ring-emerald-500 focus:border-emerald-500 transition"
-                        />
+                        ? "Create New Account"
+                        : authMode === "forgot_password"
+                        ? "Recover Account Access"
+                        : "Sign In with Email & Password"}
+                    </span>
+                    <div className="flex items-center gap-3 text-xs">
+                      {authMode !== "register" && (
                         <button
                           type="button"
-                          onClick={() => setShowPassword(!showPassword)}
-                          className="absolute right-3.5 top-2.5 text-slate-400 hover:text-white"
+                          onClick={() => {
+                            setAuthMode("register");
+                            setErrorMessage("");
+                            setSuccessNotice("");
+                          }}
+                          className="text-emerald-400 hover:underline font-medium"
                         >
-                          {showPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                          Need an account? Register
                         </button>
-                      </div>
+                      )}
+                      {authMode !== "credentials" && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setAuthMode("credentials");
+                            setErrorMessage("");
+                            setSuccessNotice("");
+                          }}
+                          className="text-emerald-400 hover:underline font-medium"
+                        >
+                          Sign In Instead
+                        </button>
+                      )}
                     </div>
+                  </div>
 
-                    {/* Role Selector */}
-                    <div>
-                      <label className="block text-xs text-slate-400 mb-1.5 font-medium">
-                        Account Access Level (Opens Dedicated Dashboard)
-                      </label>
-                      <div className="grid grid-cols-3 gap-2">
-                        {[
-                          { id: "student", label: "Student", desc: "Courses & Labs", color: "text-emerald-400" },
-                          { id: "teacher", label: "Teacher", desc: "Gradebook", color: "text-blue-400" },
-                          { id: "admin", label: "Admin", desc: "Settings & M365", color: "text-purple-400" },
-                        ].map((r) => (
-                          <button
-                            key={r.id}
-                            type="button"
-                            onClick={() => setSelectedRole(r.id as UserRole)}
-                            className={`p-2.5 rounded-xl border text-left transition ${
-                              selectedRole === r.id
-                                ? "bg-white/10 border-emerald-500 ring-1 ring-emerald-500 text-white"
-                                : "bg-[#0b0d11] border-white/5 text-slate-400 hover:text-slate-200"
-                            }`}
-                          >
-                            <span className={`text-xs font-bold block ${r.color}`}>{r.label}</span>
-                            <span className="text-[10px] text-slate-500 block truncate">{r.desc}</span>
-                          </button>
-                        ))}
-                      </div>
-                    </div>
+                  {/* Forgot Password View */}
+                  {authMode === "forgot_password" ? (
+                    <form onSubmit={handleForgotPassword} className="space-y-4">
+                      <p className="text-xs text-slate-400 leading-relaxed">
+                        Enter your registered Supabase email address below. We will send you a secure link to reset your password.
+                      </p>
 
-                    {authMode === "register" && (
                       <div>
                         <label className="block text-xs text-slate-400 mb-1 font-medium">
-                          Department / Class Group (Optional)
+                          Account Email Address
                         </label>
-                        <input
-                          type="text"
-                          value={department}
-                          onChange={(e) => setDepartment(e.target.value)}
-                          placeholder="e.g. Computer Science, Grade 11, etc."
-                          className="w-full px-3.5 py-2 rounded-xl bg-[#0b0d11] border border-white/10 text-xs text-white placeholder-slate-500 focus:outline-none focus:ring-1 focus:ring-emerald-500 focus:border-emerald-500 transition"
-                        />
+                        <div className="relative">
+                          <Mail className="w-4 h-4 text-slate-500 absolute left-3.5 top-3 pointer-events-none" />
+                          <input
+                            type="email"
+                            required
+                            value={email}
+                            onChange={(e) => setEmail(e.target.value)}
+                            placeholder="you@institution.edu"
+                            className="w-full pl-10 pr-3.5 py-2.5 rounded-xl bg-[#0b0d11] border border-white/10 text-xs text-white placeholder-slate-500 focus:outline-none focus:ring-1 focus:ring-emerald-500 focus:border-emerald-500 transition"
+                          />
+                        </div>
                       </div>
-                    )}
 
-                    <button
-                      type="submit"
-                      disabled={isLoading}
-                      className="w-full py-3 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-black font-bold text-xs flex items-center justify-center gap-2 transition shadow-lg mt-4 disabled:opacity-50"
+                      <button
+                        type="submit"
+                        disabled={isLoading}
+                        className="w-full py-3 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-black font-bold text-xs flex items-center justify-center gap-2 transition shadow-lg disabled:opacity-50"
+                      >
+                        {isLoading ? (
+                          <span>Sending Reset Email...</span>
+                        ) : (
+                          <>
+                            <span>Send Password Reset Link</span>
+                            <ArrowRight className="w-4 h-4" />
+                          </>
+                        )}
+                      </button>
+                    </form>
+                  ) : (
+                    /* Standard Login & Registration Form */
+                    <form
+                      onSubmit={authMode === "register" ? handleRegister : handleCredentialLogin}
+                      className="space-y-3.5"
                     >
-                      {isLoading ? (
-                        <span>Authenticating and opening dashboard...</span>
-                      ) : (
-                        <>
-                          <span>
-                            {authMode === "register" ? "Create Account & Enter Dashboard" : "Sign In & Enter Dashboard"}
-                          </span>
-                          <ArrowRight className="w-4 h-4" />
-                        </>
+                      {authMode === "register" && (
+                        <div>
+                          <label className="block text-xs text-slate-400 mb-1 font-medium">
+                            Full Name
+                          </label>
+                          <input
+                            type="text"
+                            required
+                            value={name}
+                            onChange={(e) => setName(e.target.value)}
+                            placeholder="e.g. Jordan Miller"
+                            className="w-full px-3.5 py-2.5 rounded-xl bg-[#0b0d11] border border-white/10 text-xs text-white placeholder-slate-500 focus:outline-none focus:ring-1 focus:ring-emerald-500 focus:border-emerald-500 transition"
+                          />
+                        </div>
                       )}
-                    </button>
-                  </form>
+
+                      <div>
+                        <label className="block text-xs text-slate-400 mb-1 font-medium">
+                          Email Address
+                        </label>
+                        <div className="relative">
+                          <Mail className="w-4 h-4 text-slate-500 absolute left-3.5 top-3 pointer-events-none" />
+                          <input
+                            type="email"
+                            required
+                            value={email}
+                            onChange={(e) => setEmail(e.target.value)}
+                            placeholder="you@institution.edu or student@domain.com"
+                            className="w-full pl-10 pr-3.5 py-2.5 rounded-xl bg-[#0b0d11] border border-white/10 text-xs text-white placeholder-slate-500 focus:outline-none focus:ring-1 focus:ring-emerald-500 focus:border-emerald-500 transition"
+                          />
+                        </div>
+                      </div>
+
+                      <div>
+                        <div className="flex items-center justify-between mb-1">
+                          <label className="text-xs text-slate-400 font-medium">
+                            Password
+                          </label>
+                          {authMode === "credentials" && isSupabaseActive && (
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setAuthMode("forgot_password");
+                                setErrorMessage("");
+                                setSuccessNotice("");
+                              }}
+                              className="text-[11px] text-slate-400 hover:text-emerald-400 transition"
+                            >
+                              Forgot Password?
+                            </button>
+                          )}
+                        </div>
+                        <div className="relative">
+                          <Lock className="w-4 h-4 text-slate-500 absolute left-3.5 top-3 pointer-events-none" />
+                          <input
+                            type={showPassword ? "text" : "password"}
+                            required
+                            value={password}
+                            onChange={(e) => setPassword(e.target.value)}
+                            placeholder="••••••••••••"
+                            className="w-full pl-10 pr-10 py-2.5 rounded-xl bg-[#0b0d11] border border-white/10 text-xs text-white placeholder-slate-500 focus:outline-none focus:ring-1 focus:ring-emerald-500 focus:border-emerald-500 transition"
+                          />
+                          <button
+                            type="button"
+                            onClick={() => setShowPassword(!showPassword)}
+                            className="absolute right-3.5 top-2.5 text-slate-400 hover:text-white"
+                          >
+                            {showPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                          </button>
+                        </div>
+                      </div>
+
+                      {/* Role Selector (For registration or default entry portal) */}
+                      <div>
+                        <label className="block text-xs text-slate-400 mb-1.5 font-medium">
+                          {authMode === "register" ? "Account Role (Permissions Level)" : "Primary Target Portal"}
+                        </label>
+                        <div className="grid grid-cols-3 gap-2">
+                          {[
+                            { id: "student", label: "Student", desc: "Courses & Labs", color: "text-emerald-400" },
+                            { id: "teacher", label: "Teacher", desc: "Gradebook", color: "text-blue-400" },
+                            { id: "admin", label: "Admin", desc: "System Config", color: "text-purple-400" },
+                          ].map((r) => (
+                            <button
+                              key={r.id}
+                              type="button"
+                              onClick={() => setSelectedRole(r.id as UserRole)}
+                              className={`p-2.5 rounded-xl border text-left transition ${
+                                selectedRole === r.id
+                                  ? "bg-white/10 border-emerald-500 ring-1 ring-emerald-500 text-white"
+                                  : "bg-[#0b0d11] border-white/5 text-slate-400 hover:text-slate-200"
+                              }`}
+                            >
+                              <span className={`text-xs font-bold block ${r.color}`}>{r.label}</span>
+                              <span className="text-[10px] text-slate-500 block truncate">{r.desc}</span>
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+
+                      {authMode === "register" && (
+                        <div>
+                          <label className="block text-xs text-slate-400 mb-1 font-medium">
+                            Department / Institution (Optional)
+                          </label>
+                          <input
+                            type="text"
+                            value={department}
+                            onChange={(e) => setDepartment(e.target.value)}
+                            placeholder="e.g. Computer Science, Grade 11, Medical Faculty"
+                            className="w-full px-3.5 py-2 rounded-xl bg-[#0b0d11] border border-white/10 text-xs text-white placeholder-slate-500 focus:outline-none focus:ring-1 focus:ring-emerald-500 focus:border-emerald-500 transition"
+                          />
+                        </div>
+                      )}
+
+                      <button
+                        type="submit"
+                        disabled={isLoading}
+                        className="w-full py-3 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-black font-bold text-xs flex items-center justify-center gap-2 transition shadow-lg mt-4 disabled:opacity-50"
+                      >
+                        {isLoading ? (
+                          <span className="flex items-center gap-2">
+                            <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                            <span>Authenticating with {isSupabaseActive ? "Supabase" : "Portal"}...</span>
+                          </span>
+                        ) : (
+                          <>
+                            <span>
+                              {authMode === "register"
+                                ? "Register Account & Open Dashboard"
+                                : "Sign In & Enter Dashboard"}
+                            </span>
+                            <ArrowRight className="w-4 h-4" />
+                          </>
+                        )}
+                      </button>
+                    </form>
+                  )}
                 </div>
               )}
 
               {/* Bottom Support / Domain Note */}
               <div className="mt-6 pt-4 border-t border-white/5 flex items-center justify-between text-[11px] text-slate-400">
-                <span className="flex items-center gap-1">
+                <span className="flex items-center gap-1.5">
                   <ShieldCheck className="w-3.5 h-3.5 text-emerald-400" />
-                  <span>Sovereign Storage Secured</span>
+                  <span>{isSupabaseActive ? "Supabase RLS & JWT Auth Active" : "Sovereign Storage Secured"}</span>
                 </span>
                 <span>{websiteSettings.supportEmail || "support@nexus-academy.internal"}</span>
               </div>

@@ -52,6 +52,7 @@ import {
 import { StorageService, DEFAULT_WEBSITE_SETTINGS } from "../utils/storage";
 import { LMS_USER_MANUAL } from "../data/lmsManual";
 import { sound } from "../utils/audio";
+import { testSupabaseAuth } from "../utils/supabase";
 import {
   THEME_PRESETS,
   AVAILABLE_LOGO_ICONS,
@@ -164,6 +165,27 @@ export const AdminSettings: React.FC<AdminSettingsProps> = ({
     setDbTestResult(null);
 
     try {
+      if (dbConfig.provider === "supabase" && (dbConfig.supabaseUrl || import.meta.env.VITE_SUPABASE_URL)) {
+        // Run direct client-side Supabase Auth ping
+        const sbLive = await testSupabaseAuth();
+        if (sbLive.success) {
+          setDbTestResult({
+            success: true,
+            latency: sbLive.latencyMs || 18,
+            details: sbLive.message,
+          });
+          const updated = {
+            ...dbConfig,
+            syncStatus: "connected" as const,
+            lastSyncTimestamp: new Date().toISOString(),
+          };
+          setDbConfig(updated);
+          StorageService.saveDatabaseConfig(updated);
+          sound.playSuccess();
+          return;
+        }
+      }
+
       const res = await fetch("/api/db-test", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -260,22 +282,27 @@ export const AdminSettings: React.FC<AdminSettingsProps> = ({
     sound.playSuccess();
   };
 
-  const sqlMigrationCode = `-- OpenLMS Sovereign Database Migration Script
--- Target: Supabase / PostgreSQL 16 (Durable User Data Sovereignty)
+  const sqlMigrationCode = `-- ==========================================
+-- Nexus LMS Sovereign Database Migration Script
+-- Target: Supabase / PostgreSQL 16
+-- ==========================================
 
-CREATE TABLE IF NOT EXISTS lms_users (
-  id VARCHAR(64) PRIMARY KEY,
+-- 1. Create LMS User Profile Table (Links to Supabase Auth)
+CREATE TABLE IF NOT EXISTS public.lms_users (
+  id VARCHAR(64) PRIMARY KEY, -- auth.uid() or unique string
   name VARCHAR(255) NOT NULL,
   email VARCHAR(255) UNIQUE NOT NULL,
   role VARCHAR(32) DEFAULT 'student',
+  department VARCHAR(255) DEFAULT '',
   total_points INT DEFAULT 0,
   streak_days INT DEFAULT 1,
   created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
-CREATE TABLE IF NOT EXISTS lms_progress (
+-- 2. Create Course Progress & SCORM Tracking Table
+CREATE TABLE IF NOT EXISTS public.lms_progress (
   id SERIAL PRIMARY KEY,
-  user_id VARCHAR(64) REFERENCES lms_users(id),
+  user_id VARCHAR(64) REFERENCES public.lms_users(id) ON DELETE CASCADE,
   course_id VARCHAR(64) NOT NULL,
   overall_percent INT DEFAULT 0,
   is_completed BOOLEAN DEFAULT FALSE,
@@ -285,9 +312,10 @@ CREATE TABLE IF NOT EXISTS lms_progress (
   UNIQUE(user_id, course_id)
 );
 
-CREATE TABLE IF NOT EXISTS lms_certificates (
+-- 3. Create Verifiable Digital Certificates Table
+CREATE TABLE IF NOT EXISTS public.lms_certificates (
   id VARCHAR(64) PRIMARY KEY,
-  user_id VARCHAR(64) REFERENCES lms_users(id),
+  user_id VARCHAR(64) REFERENCES public.lms_users(id) ON DELETE CASCADE,
   course_id VARCHAR(64) NOT NULL,
   course_title VARCHAR(255) NOT NULL,
   grade_score INT DEFAULT 100,
@@ -296,9 +324,45 @@ CREATE TABLE IF NOT EXISTS lms_certificates (
   created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
--- Enable Row Level Security (RLS) for privacy
-ALTER TABLE lms_progress ENABLE ROW LEVEL SECURITY;
-ALTER TABLE lms_certificates ENABLE ROW LEVEL SECURITY;`;
+-- 4. Enable Row Level Security (RLS)
+ALTER TABLE public.lms_users ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.lms_progress ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.lms_certificates ENABLE ROW LEVEL SECURITY;
+
+-- 5. Create RLS Policies for Sovereign Auth
+CREATE POLICY "Public profiles are readable by authenticated users"
+  ON public.lms_users FOR SELECT TO authenticated USING (true);
+
+CREATE POLICY "Users can update their own profile"
+  ON public.lms_users FOR ALL TO authenticated USING (auth.uid()::text = id);
+
+CREATE POLICY "Users can manage their own progress"
+  ON public.lms_progress FOR ALL TO authenticated USING (auth.uid()::text = user_id);
+
+CREATE POLICY "Users can read certificates"
+  ON public.lms_certificates FOR SELECT TO authenticated USING (true);
+
+-- 6. Trigger to automatically create lms_users on Supabase Auth SignUp
+CREATE OR REPLACE FUNCTION public.handle_new_user()
+RETURNS trigger AS $$
+BEGIN
+  INSERT INTO public.lms_users (id, name, email, role, department)
+  VALUES (
+    new.id,
+    COALESCE(new.raw_user_meta_data->>'full_name', split_part(new.email, '@', 1)),
+    new.email,
+    COALESCE(new.raw_user_meta_data->>'role', 'student'),
+    COALESCE(new.raw_user_meta_data->>'department', 'General Studies')
+  )
+  ON CONFLICT (id) DO UPDATE
+  SET email = EXCLUDED.email;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+CREATE OR REPLACE TRIGGER on_auth_user_created
+  AFTER INSERT ON auth.users
+  FOR EACH ROW EXECUTE FUNCTION public.handle_new_user();`;
 
   const currentUser = StorageService.getActiveUser();
 
@@ -1284,27 +1348,70 @@ ALTER TABLE lms_certificates ENABLE ROW LEVEL SECURITY;`;
 
             {/* Provider-specific Inputs */}
             {dbConfig.provider === "supabase" && (
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 animate-in fade-in">
-                <div className="space-y-1.5">
-                  <label className="text-xs font-semibold text-slate-300">Supabase Project URL</label>
-                  <input
-                    type="text"
-                    value={dbConfig.supabaseUrl}
-                    onChange={(e) => setDbConfig({ ...dbConfig, supabaseUrl: e.target.value })}
-                    placeholder="https://xyzcompany.supabase.co"
-                    className="w-full px-3.5 py-2.5 rounded-xl bg-slate-950 border border-slate-800 text-xs text-slate-200 font-mono focus:ring-1 focus:ring-indigo-500"
-                  />
+              <div className="space-y-4 animate-in fade-in">
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                  <div className="space-y-1.5">
+                    <label className="text-xs font-semibold text-slate-300">Supabase Project URL</label>
+                    <input
+                      type="text"
+                      value={dbConfig.supabaseUrl}
+                      onChange={(e) => setDbConfig({ ...dbConfig, supabaseUrl: e.target.value })}
+                      placeholder="https://xyzcompany.supabase.co"
+                      className="w-full px-3.5 py-2.5 rounded-xl bg-slate-950 border border-slate-800 text-xs text-slate-200 font-mono focus:ring-1 focus:ring-indigo-500"
+                    />
+                  </div>
+
+                  <div className="space-y-1.5">
+                    <label className="text-xs font-semibold text-slate-300">Supabase Anon Key</label>
+                    <input
+                      type="password"
+                      value={dbConfig.supabaseAnonKey}
+                      onChange={(e) => setDbConfig({ ...dbConfig, supabaseAnonKey: e.target.value })}
+                      placeholder="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+                      className="w-full px-3.5 py-2.5 rounded-xl bg-slate-950 border border-slate-800 text-xs text-slate-200 font-mono focus:ring-1 focus:ring-indigo-500"
+                    />
+                  </div>
                 </div>
 
-                <div className="space-y-1.5">
-                  <label className="text-xs font-semibold text-slate-300">Supabase Anon Key</label>
-                  <input
-                    type="password"
-                    value={dbConfig.supabaseAnonKey}
-                    onChange={(e) => setDbConfig({ ...dbConfig, supabaseAnonKey: e.target.value })}
-                    placeholder="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
-                    className="w-full px-3.5 py-2.5 rounded-xl bg-slate-950 border border-slate-800 text-xs text-slate-200 font-mono focus:ring-1 focus:ring-indigo-500"
-                  />
+                {/* Sovereign Security & Production Mode Toggles */}
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-2">
+                  <label className="flex items-start gap-3 p-3.5 rounded-xl bg-slate-950 border border-slate-800 cursor-pointer hover:border-slate-700 transition">
+                    <input
+                      type="checkbox"
+                      checked={dbConfig.enforceSupabaseAuth ?? true}
+                      onChange={(e) =>
+                        setDbConfig({ ...dbConfig, enforceSupabaseAuth: e.target.checked })
+                      }
+                      className="mt-0.5 rounded border-slate-700 text-indigo-600 focus:ring-indigo-500"
+                    />
+                    <div>
+                      <span className="text-xs font-bold text-white block">
+                        Enforce Supabase Authentication
+                      </span>
+                      <span className="text-[11px] text-slate-400 block mt-0.5 leading-normal">
+                        Requires real password verification &amp; JWT against Supabase Auth. Prevents arbitrary email logins.
+                      </span>
+                    </div>
+                  </label>
+
+                  <label className="flex items-start gap-3 p-3.5 rounded-xl bg-slate-950 border border-slate-800 cursor-pointer hover:border-slate-700 transition">
+                    <input
+                      type="checkbox"
+                      checked={dbConfig.disablePresetLogins ?? false}
+                      onChange={(e) =>
+                        setDbConfig({ ...dbConfig, disablePresetLogins: e.target.checked })
+                      }
+                      className="mt-0.5 rounded border-slate-700 text-indigo-600 focus:ring-indigo-500"
+                    />
+                    <div>
+                      <span className="text-xs font-bold text-white block">
+                        Production Mode (Disable Demo Profiles)
+                      </span>
+                      <span className="text-[11px] text-slate-400 block mt-0.5 leading-normal">
+                        Hides 1-click test profiles (Alex Rivera, Marcus Vance) on the portal login screen.
+                      </span>
+                    </div>
+                  </label>
                 </div>
               </div>
             )}

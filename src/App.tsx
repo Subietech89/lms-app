@@ -2,6 +2,7 @@ import React, { useState, useEffect } from "react";
 import { Course, CourseModule, UserRole, User, Certificate, WebsiteSettings, LmsNotification } from "./types";
 import { StorageService } from "./utils/storage";
 import { applyThemeVariables } from "./utils/theme";
+import { supabaseGetSession, supabaseSignOut } from "./utils/supabase";
 import { Navbar } from "./components/Navbar";
 import { LoginScreen } from "./components/LoginScreen";
 import { NotificationCenter } from "./components/NotificationCenter";
@@ -83,6 +84,25 @@ export function App() {
     }
   }, [courses, isAuthenticated]);
 
+  // Check active Supabase auth session on mount
+  useEffect(() => {
+    const checkSupabaseSession = async () => {
+      try {
+        const sessionUser = await supabaseGetSession();
+        if (sessionUser) {
+          const lmsUser = StorageService.getActiveUser();
+          if (!isAuthenticated) {
+            setIsAuthenticated(true);
+            setCurrentRole(sessionUser.role || lmsUser.role);
+          }
+        }
+      } catch {
+        // Fallback to local session
+      }
+    };
+    checkSupabaseSession();
+  }, []);
+
   // Login handler: open dashboard based on access level
   const handleLoginSuccess = (user: User) => {
     setIsAuthenticated(true);
@@ -98,7 +118,12 @@ export function App() {
   };
 
   // Logout handler
-  const handleLogout = () => {
+  const handleLogout = async () => {
+    try {
+      await supabaseSignOut();
+    } catch {
+      // Ignore
+    }
     StorageService.logout();
     setIsAuthenticated(false);
     setActiveView("catalog");

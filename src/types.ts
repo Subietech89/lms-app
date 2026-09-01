@@ -197,6 +197,8 @@ export interface DatabaseConfig {
   supabaseUrl: string;
   supabaseAnonKey: string;
   supabaseServiceKey?: string;
+  enforceSupabaseAuth?: boolean;
+  disablePresetLogins?: boolean;
   pgHost: string;
   pgPort: number;
   pgDatabase: string;

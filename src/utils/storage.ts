@@ -88,8 +88,10 @@ export const PRESET_USERS: Record<UserRole, User> = {
 
 const DEFAULT_DB_CONFIG: DatabaseConfig = {
   provider: "supabase",
-  supabaseUrl: "https://xyzcompany.supabase.co",
-  supabaseAnonKey: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
+  supabaseUrl: "",
+  supabaseAnonKey: "",
+  enforceSupabaseAuth: true,
+  disablePresetLogins: false,
   pgHost: "db.internal.proxmox.lan",
   pgPort: 5432,
   pgDatabase: "openlms_userdata",
